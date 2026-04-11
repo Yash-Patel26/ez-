@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.env
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+output/batch_audit/
+output/audit_*
+output/final_*
+.~lock.*
+*.~lock*

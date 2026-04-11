@@ -1,0 +1,67 @@
+# MD2PPTX Configuration
+# All measurements in inches unless otherwise noted
+
+slide_count:
+  min: 10
+  max: 15
+  default: 12
+
+# Slide dimensions (16:9 aspect ratio)
+slide:
+  width: 13.333    # inches
+  height: 7.5      # inches
+
+# Grid system - derived from Slide Master analysis
+grid:
+  columns: 12
+  margin_left: 0.375
+  margin_right: 0.375
+  margin_top: 1.40       # below title area
+  margin_bottom: 0.40
+  gutter: 0.20           # between columns
+  title_left: 0.375
+  title_top: 0.656
+  title_width: 11.646
+  title_height: 0.58
+  footer_top: 7.229
+  footer_height: 0.135
+
+# Typography - sizes in points
+typography:
+  title_size: 28
+  subtitle_size: 20
+  body_size: 14
+  bullet_size: 13
+  label_size: 11
+  caption_size: 9
+  kpi_value_size: 36
+  chart_label_size: 10
+
+# Content limits per slide
+content:
+  max_bullets_per_slide: 5
+  max_text_lines: 6
+  max_words_per_bullet: 12
+  max_table_rows: 6
+  max_table_cols: 6
+  max_process_steps: 5
+  max_timeline_items: 6
+  max_kpi_cards: 4
+  max_comparison_items: 3
+
+# LLM settings
+llm:
+  model: "gemini-2.5-flash"
+  max_tokens: 4096
+  temperature: 0.3
+
+# Visual settings
+visuals:
+  chart_width: 10.0       # inches - centered in content area
+  chart_height: 4.5
+  table_row_height: 0.45
+  kpi_card_height: 1.8
+  process_step_height: 1.5
+  timeline_height: 2.5
+  shape_corner_radius: 0.1  # inches - for rounded rectangles
+  shape_border_width: 1.0   # points
