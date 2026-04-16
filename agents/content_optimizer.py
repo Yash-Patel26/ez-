@@ -27,6 +27,7 @@ from core.models import (
     ComparisonItem,
     ContentBlock,
     DocumentIR,
+    FunnelItem,
     KPIItem,
     OptimizedSlideContent,
     ProcessStep,
@@ -49,15 +50,44 @@ _KPI_PATTERNS = [
 ]
 
 _CITATION_PATTERN = re.compile(r'\s*\[\d+\]\s*')
+# Markdown formatting patterns: **bold**, *italic*, __bold__, _italic_, ##heading
+_MARKDOWN_PATTERN = re.compile(
+    r'\*\*(.+?)\*\*'      # **bold**
+    r'|\*(.+?)\*'          # *italic*
+    r'|__(.+?)__'          # __bold__
+    r'|_(.+?)_'            # _italic_
+    r'|`(.+?)`'            # `code`
+    r'|#{1,6}\s+'          # ## headings
+    r'|\*\*\*(.+?)\*\*\*'  # ***bold-italic***
+)
 
 
 def _strip_citations(text: str) -> str:
     return _CITATION_PATTERN.sub(' ', text).strip()
 
 
+def _strip_markdown(text: str) -> str:
+    """Strip markdown formatting from text, keeping the plain content."""
+    if not text:
+        return text
+    # Replace **bold**, *italic*, etc. with their plain content
+    def _replace(m: re.Match) -> str:
+        # Return whichever capture group matched
+        return next((g for g in m.groups() if g is not None), '')
+    text = re.sub(
+        r'\*\*\*(.+?)\*\*\*|\*\*(.+?)\*\*|\*(.+?)\*|__(.+?)__|_(.+?)_|`(.+?)`',
+        _replace, text
+    )
+    # Strip heading markers (## Title → Title)
+    text = re.sub(r'^#{1,6}\s+', '', text, flags=re.MULTILINE)
+    # Strip horizontal rules
+    text = re.sub(r'^[-*_]{3,}\s*$', '', text, flags=re.MULTILINE)
+    return text.strip()
+
+
 def _truncate_bullet(text: str, max_words: int = 15) -> str:
     """Truncate a bullet to max_words, keeping meaningful content."""
-    text = _strip_citations(text)
+    text = _strip_markdown(_strip_citations(text))
     words = text.split()
     if len(words) <= max_words:
         return text
@@ -116,7 +146,12 @@ class ContentOptimizer:
                         matched_sub = sub
                         break
                 if matched_sub:
-                    sections.append(matched_sub)
+                    # Only use the subsection if it has actual content;
+                    # otherwise fall back to the parent so bullets aren't empty.
+                    if matched_sub.content_blocks or matched_sub.subsections:
+                        sections.append(matched_sub)
+                    else:
+                        sections.append(parent)
                 else:
                     sections.append(parent)
         return sections
@@ -181,11 +216,29 @@ class ContentOptimizer:
         if treatment == "timeline":
             return self._optimize_timeline(spec, sections, all_text)
 
-        if treatment in ("comparison_cards", "two_column"):
+        if treatment == "comparison_cards":
+            return self._optimize_comparison(spec, sections, all_text, treatment="comparison_cards")
+
+        if treatment == "two_column":
             return self._optimize_comparison(spec, sections, all_text)
 
         if treatment == "three_column":
             return self._optimize_three_column(spec, sections, all_text)
+
+        if treatment == "icon_grid":
+            return self._optimize_icon_grid(spec, sections, all_text)
+
+        if treatment == "funnel":
+            return self._optimize_funnel(spec, sections, all_text)
+
+        if treatment == "divider_layout":
+            return OptimizedSlideContent(
+                slide_number=spec.slide_number,
+                slide_type=spec.slide_type,
+                title=spec.title,
+                visual_treatment="divider_layout",
+                key_message=spec.key_message,
+            )
 
         # Default: bullets
         return self._optimize_bullets(spec, sections, all_text)
@@ -272,6 +325,18 @@ CONTENT:
                 seen.add(key)
                 unique.append(b)
 
+        # Last resort: if still empty, use section/subsection headings as bullets
+        # so the slide always shows something rather than a blank body.
+        if not unique:
+            for section in sections:
+                h = re.sub(r'^\d+(\.\d+)*\.?\s*', '', section.heading).strip()
+                if h and h.lower() != (spec.title or "").lower():
+                    unique.append(h)
+                for sub in section.subsections[:4]:
+                    sh = re.sub(r'^\d+(\.\d+)*\.?\s*', '', sub.heading).strip()
+                    if sh and sh not in unique:
+                        unique.append(sh)
+
         return OptimizedSlideContent(
             slide_number=spec.slide_number,
             slide_type=spec.slide_type,
@@ -330,7 +395,7 @@ CONTENT:
                 # Limit rows and clean content
                 rows = block.rows[:self.max_table_rows]
                 headers = block.headers[:6]  # max 6 columns
-                rows = [[_strip_citations(cell)[:50] for cell in row[:6]] for row in rows]
+                rows = [[_strip_markdown(_strip_citations(cell))[:50] for cell in row[:6]] for row in rows]
 
                 # Pad rows to match header count
                 for row in rows:
@@ -370,10 +435,15 @@ CONTENT:
                 for pattern in _KPI_PATTERNS:
                     for match in pattern.finditer(text):
                         value = match.group(1).strip()
-                        # Find context around the value
-                        start = max(0, match.start() - 60)
-                        end = min(len(text), match.end() + 60)
-                        context = text[start:end]
+                        # Snap context boundaries to whole words so we never
+                        # return mid-word fragments like 'pacity contribute...'
+                        raw_start = max(0, match.start() - 70)
+                        # Move forward to the next space (word boundary)
+                        if raw_start > 0:
+                            sp = text.find(' ', raw_start)
+                            raw_start = sp + 1 if sp != -1 else raw_start
+                        end = min(len(text), match.end() + 70)
+                        context = text[raw_start:end]
 
                         # Extract a label from surrounding words
                         label = self._extract_kpi_label(context, value)
@@ -483,7 +553,8 @@ CONTENT:
         )
 
     def _optimize_comparison(
-        self, spec: SlideSpec, sections: list[Section], all_text: str
+        self, spec: SlideSpec, sections: list[Section], all_text: str,
+        treatment: str = "two_column",
     ) -> OptimizedSlideContent:
         """Create two-column comparison content."""
         left = []
@@ -523,14 +594,32 @@ CONTENT:
         if not left and not right:
             return self._optimize_bullets(spec, sections, all_text)
 
+        # For comparison_cards, also populate comparison_items for VS-badge layout
+        comp_items = None
+        if treatment == "comparison_cards":
+            comp_titles = ["Option A", "Option B"]
+            subs = sections[0].subsections if sections and sections[0].subsections else []
+            if len(subs) >= 2:
+                comp_titles = [
+                    re.sub(r'^\d+(\.\d+)*\.?\s*', '', subs[0].heading)[:30],
+                    re.sub(r'^\d+(\.\d+)*\.?\s*', '', subs[1].heading)[:30],
+                ]
+            elif len(sections) >= 2:
+                comp_titles = [sections[0].heading[:30], sections[1].heading[:30]]
+            comp_items = [
+                ComparisonItem(title=comp_titles[0], points=left or ["Key point"]),
+                ComparisonItem(title=comp_titles[1], points=right or ["Key point"]),
+            ]
+
         return OptimizedSlideContent(
             slide_number=spec.slide_number,
             slide_type=spec.slide_type,
             title=spec.title,
-            visual_treatment="two_column",
+            visual_treatment=treatment,
             key_message=spec.key_message,
             left_column=left or ["No data available"],
             right_column=right or ["No data available"],
+            comparison_items=comp_items,
         )
 
     def _optimize_three_column(
@@ -579,6 +668,111 @@ CONTENT:
             comparison_items=comp_items,
         )
 
+    def _optimize_icon_grid(
+        self, spec: SlideSpec, sections: list[Section], all_text: str
+    ) -> OptimizedSlideContent:
+        """Extract 4–6 categorised items for an icon-grid infographic card layout.
+
+        Each card gets a title (first 3–5 words) and a description (the rest).
+        """
+        items: list[ComparisonItem] = []
+
+        for block in self._collect_blocks(sections):
+            if block.type not in ("bullet_list", "numbered_list") or not block.items:
+                continue
+            for raw in block.items[:6]:
+                raw = _strip_citations(raw).strip()
+                # Split on first ':', '—', ' – ', or ' - '
+                for sep in (":", " — ", " – ", " - "):
+                    if sep in raw:
+                        title, desc = raw.split(sep, 1)
+                        break
+                else:
+                    # No separator — use first 4 words as title
+                    words = raw.split()
+                    title = " ".join(words[:4])
+                    desc = " ".join(words[4:])
+
+                title = title.strip()[:40]
+                desc = desc.strip()[:100]
+                if title:
+                    items.append(ComparisonItem(
+                        title=title,
+                        points=[desc] if desc else [],
+                    ))
+            if items:
+                break  # Use the first list block only
+
+        if len(items) < 4:
+            # Fallback: build items from subsection headings + first bullet each
+            items = []
+            for sub in (sections[0].subsections if sections else [])[:6]:
+                heading = re.sub(r'^\d+(\.\d+)*\.?\s*', '', sub.heading).strip()[:40]
+                first_point = ""
+                for blk in sub.content_blocks:
+                    if blk.items:
+                        first_point = _truncate_bullet(blk.items[0], 12)
+                        break
+                    if blk.content:
+                        first_point = _truncate_bullet(blk.content, 12)
+                        break
+                if heading:
+                    items.append(ComparisonItem(title=heading, points=[first_point] if first_point else []))
+
+        if len(items) < 3:
+            return self._optimize_bullets(spec, sections, all_text)
+
+        return OptimizedSlideContent(
+            slide_number=spec.slide_number,
+            slide_type=spec.slide_type,
+            title=spec.title,
+            visual_treatment="icon_grid",
+            key_message=spec.key_message,
+            comparison_items=items[:6],
+        )
+
+    def _optimize_funnel(
+        self, spec: SlideSpec, sections: list[Section], all_text: str
+    ) -> OptimizedSlideContent:
+        """Extract 3–5 funnel stages from numbered/bullet lists.
+
+        Values (numbers, percentages, currencies) are separated from labels.
+        """
+        _value_re = re.compile(
+            r'([\$€£₹]?\s*[\d,]+\.?\d*\s*(?:%|[KMBkm](?:illion|rillion)?|'
+            r'leads?|applicants?|candidates?|users?|customers?))',
+            re.IGNORECASE,
+        )
+
+        funnel_items: list[FunnelItem] = []
+
+        for block in self._collect_blocks(sections):
+            if block.type not in ("numbered_list", "bullet_list") or not block.items:
+                continue
+            for raw in block.items[:5]:
+                raw = _strip_citations(raw).strip()
+                # Extract embedded numeric value
+                m = _value_re.search(raw)
+                value = m.group(1).strip() if m else ""
+                label = _value_re.sub("", raw).strip(" :–—-")
+                label = _truncate_bullet(label, 7)
+                if label:
+                    funnel_items.append(FunnelItem(label=label, value=value))
+            if funnel_items:
+                break
+
+        if len(funnel_items) < 3:
+            return self._optimize_bullets(spec, sections, all_text)
+
+        return OptimizedSlideContent(
+            slide_number=spec.slide_number,
+            slide_type=spec.slide_type,
+            title=spec.title,
+            visual_treatment="funnel",
+            key_message=spec.key_message,
+            funnel_items=funnel_items[:5],
+        )
+
     # ──────────────────────────────────────────────
     # Helper methods
     # ──────────────────────────────────────────────
@@ -595,6 +789,17 @@ CONTENT:
             clean = re.sub(r'^\d+(\.\d+)*\.?\s*', '', s.heading).strip()
             if clean and len(items) < 6:
                 items.append(clean)
+
+        # Fallback: all sections were filtered — use subsection headings instead
+        if not items:
+            for s in doc.sections:
+                for sub in s.subsections:
+                    clean = re.sub(r'^\d+(\.\d+)*\.?\s*', '', sub.heading).strip()
+                    if clean and len(items) < 6:
+                        items.append(clean)
+                if len(items) >= 3:
+                    break
+
         return items
 
     def _collect_blocks(self, sections: list[Section]) -> list[ContentBlock]:
@@ -719,18 +924,49 @@ CONTENT:
         return None
 
     def _extract_kpi_label(self, context: str, value: str) -> str | None:
-        """Extract a short label for a KPI value from surrounding text."""
-        # Remove the value itself
-        text = context.replace(value, '').strip()
-        text = _strip_citations(text)
+        """Extract a short label for a KPI value from surrounding text.
 
-        # Look for key nouns/phrases near the value
-        words = text.split()
-        meaningful = [w for w in words
-                      if len(w) > 2 and not w.startswith('(') and not w.startswith('http')]
+        Strategy: prefer words that come BEFORE the value in the sentence
+        (they are almost always the metric name), fall back to words after.
+        """
+        context = _strip_citations(context)
+        val_idx = context.find(value)
+        if val_idx == -1:
+            val_idx = len(context)
 
-        if meaningful:
-            label = ' '.join(meaningful[:4])
-            return label[:40]
+        before = context[:val_idx].strip()
+        after  = context[val_idx + len(value):].strip()
+
+        _stop = {'the', 'a', 'an', 'of', 'in', 'at', 'to', 'for', 'and',
+                 'or', 'is', 'are', 'was', 'has', 'have', 'its', 'with',
+                 'by', 'that', 'this', 'from', 'as', 'on', 'be', 'it',
+                 # Connector/modifier words that appear right before values
+                 'approximately', 'around', 'about', 'nearly', 'roughly',
+                 'over', 'above', 'below', 'under', 'stood', 'reached',
+                 'hit', 'exceeding', 'exceeded', 'increasing', 'growing',
+                 'declining', 'fallen', 'rising', 'totaling', 'totalling',
+                 'representing', 'accounting', 'comprising', 'reaching',
+                 'surpassing', 'surpassed', 'estimated', 'projected',
+                 'recorded', 'reported', 'achieved', 'generated',
+                 'currently', 'approximately'}
+
+        def _clean_words(text: str) -> list[str]:
+            words = text.split()
+            return [w.strip('.,;:()[]"\'') for w in words
+                    if len(w) > 2
+                    and w.lower() not in _stop
+                    and not w.startswith('http')]
+
+        # Try the last 4 meaningful words before the value first
+        before_words = _clean_words(before)
+        if before_words:
+            label = ' '.join(before_words[-4:])
+            if len(label) >= 4:
+                return label[:40]
+
+        # Fall back to first meaningful words after the value
+        after_words = _clean_words(after)
+        if after_words:
+            return ' '.join(after_words[:4])[:40]
 
         return None

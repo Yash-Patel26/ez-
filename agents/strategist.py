@@ -323,12 +323,35 @@ Return ONLY the JSON array, no other text."""
             if not expanded:
                 break  # Truly nothing left to expand
 
+        # ── Insert section divider markers ──────────────────────
+        # For documents with 3+ section groups, inject a divider slide at the
+        # natural content midpoint.  A sentinel value (None, section) signals
+        # "emit a divider here" during the loop below.
+        if len(groups) >= 3:
+            mid = len(groups) // 2
+            divider_sec = groups[mid][1]
+            groups = list(groups[:mid]) + [(None, divider_sec)] + list(groups[mid:])
+
         # Track recent treatments to enforce visual variety
         recent_treatments: list[str] = []
 
         for group_indices, primary_section in groups:
             if slide_num >= target_slides - 1:
                 break
+
+            # ── Section divider sentinel ──────────────────────────
+            if group_indices is None:
+                slides.append(SlideSpec(
+                    slide_number=slide_num,
+                    slide_type="divider",
+                    title=self._clean_title(primary_section.heading),
+                    key_message="",
+                    source_sections=[],
+                    visual_treatment="divider_layout",
+                    content_priority="low",
+                ))
+                slide_num += 1
+                continue
 
             treatment = self._pick_visual_treatment(primary_section)
 
@@ -621,11 +644,20 @@ Return ONLY the JSON array, no other text."""
 
         return groups
 
+    # Keywords that suggest a funnel / pipeline slide
+    _FUNNEL_KW = {
+        "funnel", "pipeline", "conversion", "hiring process", "recruitment process",
+        "sales process", "lead", "adoption", "onboarding", "stages", "journey",
+        "attrition", "dropout", "retention funnel",
+    }
+
     def _pick_visual_treatment(self, section: Section) -> str:
         """Choose the best visual treatment based on section content.
 
         Infographic-first: prioritize charts > KPIs > tables > columns > bullets.
         """
+        heading_lower = section.heading.lower()
+
         # Priority 1: Tables with numeric data → chart
         if section.has_table_data:
             for block in self._all_blocks(section):
@@ -648,11 +680,36 @@ Return ONLY the JSON array, no other text."""
             # Even 1 numeric block → try chart from text
             return "chart_bar"
 
+        # Priority 2.5 (infographic): Funnel diagram for pipeline / stage content
+        if any(kw in heading_lower for kw in self._FUNNEL_KW):
+            has_list = any(
+                b.type in ("numbered_list", "bullet_list") and b.items
+                for b in self._all_blocks(section)
+            )
+            if has_list:
+                return "funnel"
+
         # Priority 3: Multi-column for subsection structure
         if len(section.subsections) == 2:
+            # Use comparison_cards when subsection headings signal a VS / options framing
+            sub_text = " ".join(s.heading.lower() for s in section.subsections)
+            _cmp_kw = {
+                "vs", "versus", "vs.", "option", "approach", "alternative",
+                "traditional", "modern", "before", "after", "pros", "cons",
+                "advantage", "disadvantage", "method", "strategy a", "strategy b",
+            }
+            if any(kw in sub_text for kw in _cmp_kw):
+                return "comparison_cards"
             return "two_column"
         if len(section.subsections) >= 3:
             return "three_column"
+
+        # Priority 3.5 (infographic): Icon grid for 4–6 categorised bullet items
+        for block in self._all_blocks(section):
+            if block.type in ("bullet_list", "numbered_list") and block.items:
+                if 4 <= len(block.items) <= 6:
+                    return "icon_grid"
+                break  # Only inspect the first list block
 
         # Priority 4: Fallback to bullets (last resort)
         return "bullets"
@@ -664,12 +721,15 @@ Return ONLY the JSON array, no other text."""
         """
         # Define rotation options for each treatment type
         rotations = {
-            "three_column": ["two_column", "kpi_cards", "bullets", "process_flow"],
-            "bullets": ["two_column", "kpi_cards", "three_column", "process_flow"],
-            "kpi_cards": ["chart_bar", "two_column", "three_column", "bullets"],
-            "chart_bar": ["table", "kpi_cards", "two_column", "bullets"],
-            "two_column": ["three_column", "bullets", "kpi_cards", "process_flow"],
-            "table": ["chart_bar", "kpi_cards", "bullets", "two_column"],
+            "three_column":    ["two_column", "kpi_cards", "icon_grid", "bullets", "process_flow"],
+            "bullets":         ["icon_grid", "two_column", "kpi_cards", "three_column", "process_flow"],
+            "kpi_cards":       ["chart_bar", "two_column", "three_column", "icon_grid", "bullets"],
+            "chart_bar":       ["table", "kpi_cards", "two_column", "bullets"],
+            "two_column":      ["comparison_cards", "three_column", "bullets", "kpi_cards", "process_flow"],
+            "table":           ["chart_bar", "kpi_cards", "bullets", "two_column"],
+            "icon_grid":       ["two_column", "bullets", "three_column", "kpi_cards"],
+            "funnel":          ["process_flow", "bullets", "kpi_cards"],
+            "comparison_cards":["two_column", "three_column", "bullets"],
         }
         alternatives = rotations.get(current, ["bullets", "two_column", "kpi_cards"])
 
@@ -689,6 +749,15 @@ Return ONLY the JSON array, no other text."""
                 b.type in ("bullet_list", "numbered_list") for b in self._all_blocks(section)
             ):
                 return alt
+            if alt == "icon_grid" and any(
+                b.type in ("bullet_list", "numbered_list") and b.items and 4 <= len(b.items) <= 6
+                for b in self._all_blocks(section)
+            ):
+                return alt
+            if alt in ("comparison_cards", "funnel") and any(
+                b.type in ("bullet_list", "numbered_list") for b in self._all_blocks(section)
+            ):
+                return alt
             if alt == "bullets":
                 return alt
 
@@ -705,10 +774,12 @@ Return ONLY the JSON array, no other text."""
             return "kpi_callout"
         if treatment in ("two_column", "comparison_cards"):
             return "comparison"
-        if treatment == "process_flow":
+        if treatment in ("process_flow", "funnel"):
             return "process_flow"
         if treatment == "timeline":
             return "timeline"
+        if treatment == "icon_grid":
+            return "content"
         return "content"
 
     def _clean_title(self, heading: str) -> str:

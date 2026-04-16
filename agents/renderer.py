@@ -75,9 +75,11 @@ class PPTXRenderer:
 
             # Render based on slide type
             if content.slide_type == "cover":
-                self._render_cover(slide, content, pptx_layout)
+                self._render_cover(slide, content, layout_spec)
             elif content.slide_type == "thank_you":
                 self._render_thank_you(slide, content)
+            elif content.slide_type == "divider":
+                self._render_divider(slide, layout_spec, content)
             else:
                 self._render_content_slide(slide, layout_spec, content)
 
@@ -101,12 +103,38 @@ class PPTXRenderer:
             prs.slides._sldIdLst.remove(sldId)
 
     def _build_layout_map(self, prs: Presentation) -> dict[str, object]:
-        """Build a mapping from layout name to layout object."""
+        """Build a mapping from layout name to layout object.
+
+        Templates often have duplicate layout names (e.g. three copies of
+        '1_E_Title, Subtitle and Body', where the last one is a 'Thank you!'
+        variant with that text baked into its shapes).  Overwriting the map
+        with the last duplicate would inject 'Thank you!' onto every content
+        slide.  Fix: store only the FIRST occurrence under the plain name, and
+        separately capture any layout whose shapes contain 'thank you' text so
+        the closing slide can find it explicitly.
+        """
         layout_map = {}
         for layout in prs.slide_layouts:
-            layout_map[layout.name.lower()] = layout
-            # Also map by index
-            layout_map[f"idx_{prs.slide_layouts.index(layout)}"] = layout
+            idx_key = f"idx_{prs.slide_layouts.index(layout)}"
+            layout_map[idx_key] = layout
+
+            name_lower = layout.name.lower()
+
+            # Detect layouts that have 'thank you' text baked into their shapes
+            has_thankyou_text = any(
+                "thank you" in sh.text_frame.text.lower()
+                for sh in layout.shapes
+                if sh.has_text_frame
+            )
+            if has_thankyou_text:
+                # Store under a special key for the closing slide, but do NOT
+                # overwrite the clean content-layout entry under the plain name
+                layout_map.setdefault("_thankyou_layout", layout)
+                continue
+
+            # Only store the first occurrence under the plain name
+            layout_map.setdefault(name_lower, layout)
+
         return layout_map
 
     def _find_layout(self, layout_map: dict, layout_name: str) -> object:
@@ -124,8 +152,9 @@ class PPTXRenderer:
             "divider": ["divider", "c_section blue"],
             "blank": ["blank", "1_e_title, subtitle and body"],
             "title_only": ["title only", "1_e_title, subtitle and body"],
-            "thank_you": ["thank you", "1_thank you", "0_title company",
-                          "title company"],
+            # Prefer the layout that already has 'thank you' text baked in
+            "thank_you": ["_thankyou_layout", "thank you", "1_thank you",
+                          "0_title company", "title company"],
         }
 
         if name_lower in type_names:
@@ -149,16 +178,13 @@ class PPTXRenderer:
     def _render_cover(
         self, slide, content: OptimizedSlideContent, layout
     ) -> None:
-        """Render the cover slide using template placeholders."""
-        # Try to use template placeholders first
+        """Render the cover slide using template placeholders + decorative shapes."""
         placeholders = list(slide.placeholders)
 
         if len(placeholders) >= 2:
             placeholders[0].text = content.title or ""
-            if content.subtitle and len(placeholders) > 1:
+            if content.subtitle:
                 placeholders[1].text = content.subtitle or ""
-
-            # Style + zero margins on unfilled placeholders (Common Mistake #14)
             for ph in placeholders:
                 ph.text_frame.margin_left = 0
                 ph.text_frame.margin_right = 0
@@ -170,10 +196,6 @@ class PPTXRenderer:
             placeholders[0].text = content.title or ""
         else:
             # No placeholders — add text boxes
-            for spec in content.bullets or []:
-                pass  # Handled by shapes below
-
-            # Add title as text box
             txBox = slide.shapes.add_textbox(
                 Inches(0.375), Inches(3.1), Inches(9.3), Inches(0.7)
             )
@@ -194,12 +216,32 @@ class PPTXRenderer:
                 tf2.paragraphs[0].font.name = self.theme.fonts.minor
                 tf2.paragraphs[0].font.color.rgb = _resolve_color("dk2", self.theme)
 
+        # Add the layout engine's decorative shapes on top of placeholders.
+        # Skip pure text-box shapes (title/subtitle already handled above)
+        # to avoid duplicates; only add non-text decorative elements.
+        for spec in getattr(layout, 'shapes', []):
+            if spec.shape_type == "text_box":
+                continue  # title/subtitle from placeholders already
+            self.visual_gen.add_shape(slide, spec, self.theme)
+
     def _render_thank_you(self, slide, content: OptimizedSlideContent) -> None:
         """Render the thank you/closing slide.
 
-        Uses template placeholders if available; adds text boxes as fallback
-        so the slide is never completely empty.
+        If the template layout already has 'Thank you' text baked into its
+        shapes, we leave it alone — adding text would create a duplicate.
+        Only populate placeholders or add a fallback text box when the layout
+        has no such pre-existing text.
         """
+        # Check if the layout already has "thank you" text baked in
+        layout_has_thankyou = any(
+            "thank you" in sh.text_frame.text.lower()
+            for sh in slide.slide_layout.shapes
+            if sh.has_text_frame
+        )
+        if layout_has_thankyou:
+            # Template provides the text — nothing to add
+            return
+
         placeholders = list(slide.placeholders)
 
         if placeholders:
@@ -223,20 +265,63 @@ class PPTXRenderer:
             tf.paragraphs[0].font.color.rgb = _resolve_color("dk1", self.theme)
             tf.paragraphs[0].alignment = PP_ALIGN.CENTER
 
+    def _render_divider(
+        self, slide, layout: SlideLayout, content: OptimizedSlideContent
+    ) -> None:
+        """Render a section-divider slide.
+
+        The C_Section blue template layout provides the dark background.
+        We only add our decorative shapes on top — no placeholder text is set
+        so the template's own look is preserved cleanly.
+        """
+        for spec in layout.shapes:
+            self.visual_gen.add_shape(slide, spec, self.theme)
+
+    def _populate_placeholders(self, slide, title: str, subtitle: str = "") -> None:
+        """Set title and subtitle template placeholders using the template's own fonts.
+
+        Using placeholders ensures the slide master's font, size, and positioning
+        are respected — giving consistent rendering across templates.
+        """
+        for ph in slide.placeholders:
+            try:
+                idx = ph.placeholder_format.idx
+            except Exception:
+                continue
+
+            if idx == 0 and title:
+                ph.text = title
+                tf = ph.text_frame
+                tf.margin_left = 0
+                tf.margin_top = 0
+                for para in tf.paragraphs:
+                    para.font.name = self.theme.fonts.major
+                    para.font.bold = True
+
+            elif idx == 1 and subtitle:
+                ph.text = subtitle
+                tf = ph.text_frame
+                tf.margin_left = 0
+                tf.margin_top = 0
+                for para in tf.paragraphs:
+                    para.font.name = self.theme.fonts.minor
+                    para.font.size = Pt(13)
+
     def _render_content_slide(
         self, slide, layout: SlideLayout, content: OptimizedSlideContent
     ) -> None:
         """Render a content slide with shapes, charts, tables.
 
-        Guideline 2B: Title uses MAJOR font, body uses MINOR font.
-        Guideline 4A: Max 2 fonts, consistent sizing.
+        Title goes into the template's PH0 (preserves template font/positioning).
+        Key message goes into PH1 as subtitle.
+        All decorative and content shapes are then added on top.
         """
+        # Populate template placeholders first so the slide title uses
+        # the template's own font size, color, and position.
+        self._populate_placeholders(slide, content.title, content.key_message)
+
         # Render each shape from the layout
         for spec in layout.shapes:
-            # Determine if this is a title shape (Guideline 2B: use major font)
-            is_title = (spec.font_size and spec.font_size >= 28
-                        and spec.position.top < 1.0)
-
             if spec.shape_type == "chart":
                 if content.chart_data:
                     self.visual_gen.add_chart(slide, content.chart_data, spec)
@@ -244,5 +329,4 @@ class PPTXRenderer:
                 if content.table_data:
                     self.visual_gen.add_table(slide, content.table_data, spec)
             else:
-                # Render generic shape
                 self.visual_gen.add_shape(slide, spec, self.theme)

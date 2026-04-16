@@ -113,7 +113,7 @@ class LayoutEngine:
             return "thank_you"
         if slide.slide_type == "divider":
             return "divider"
-        return "blank"
+        return "title_only"
 
     def _compute_shapes(self, slide: OptimizedSlideContent) -> list[ShapeSpec]:
         vt = slide.visual_treatment
@@ -132,7 +132,10 @@ class LayoutEngine:
             "timeline": self._shapes_timeline,
             "two_column": self._shapes_two_column,
             "three_column": self._shapes_three_column,
-            "comparison_cards": self._shapes_two_column,
+            "comparison_cards": self._shapes_comparison_cards,
+            "icon_grid": self._shapes_icon_grid,
+            "funnel": self._shapes_funnel,
+            "divider_layout": self._shapes_divider,
         }
         return dispatch.get(vt, self._shapes_bullets)(slide)
 
@@ -142,62 +145,50 @@ class LayoutEngine:
     # ═══════════════════════════════════════════════
 
     def _add_header(self, shapes: list[ShapeSpec], slide: OptimizedSlideContent) -> float:
-        # Left accent bar (vertical colored strip along title)
+        """Add slide header decorations. Title/subtitle are rendered via template
+        placeholders (PH0/PH1) in the renderer, so we only add the accent bar,
+        divider line, footer line, and topic icon here."""
+
+        # Left accent bar — spans from PH0 top (0.42) through PH1 bottom (~1.32)
         shapes.append(ShapeSpec(
             shape_type="rectangle",
-            position=Position(left=0.15, top=GRID.TITLE_TOP, width=0.07, height=0.58),
+            position=Position(left=0.15, top=0.40, width=0.07, height=0.92),
             fill_color="accent1",
         ))
 
-        # Title
-        shapes.append(ShapeSpec(
-            shape_type="text_box",
-            position=Position(left=GRID.TITLE_LEFT, top=GRID.TITLE_TOP,
-                              width=GRID.TITLE_WIDTH, height=GRID.TITLE_HEIGHT),
-            text=slide.title, font_size=28, font_bold=True,
-            font_color="dk1", alignment="left",
-        ))
-
-        y = GRID.TITLE_TOP + GRID.TITLE_HEIGHT + 0.05
-
-        # Key message subtitle
-        if slide.key_message:
-            shapes.append(ShapeSpec(
-                shape_type="text_box",
-                position=Position(left=GRID.TITLE_LEFT, top=y,
-                                  width=GRID.TITLE_WIDTH, height=0.30),
-                text=slide.key_message, font_size=13, font_color="dk2", alignment="left",
-            ))
-            y += 0.32
-
-        # Full-width accent divider line
+        # Full-width accent divider line below the title/subtitle area
+        divider_y = GRID.MARGIN_TOP - 0.08   # just above content start
         shapes.append(ShapeSpec(
             shape_type="line",
-            position=Position(left=GRID.TITLE_LEFT, top=y, width=GRID.TITLE_WIDTH, height=0),
+            position=Position(left=GRID.TITLE_LEFT, top=divider_y,
+                              width=GRID.TITLE_WIDTH, height=0),
             font_color="accent1", border_width=1.5,
         ))
 
         # Footer accent line at bottom
         shapes.append(ShapeSpec(
             shape_type="line",
-            position=Position(left=GRID.TITLE_LEFT, top=7.05, width=GRID.TITLE_WIDTH, height=0),
+            position=Position(left=GRID.TITLE_LEFT, top=7.05,
+                              width=GRID.TITLE_WIDTH, height=0),
             font_color="lt2", border_width=0.75,
         ))
 
-        # Footer context text (like sample: "Title | Category")
-        shapes.append(ShapeSpec(
-            shape_type="text_box",
-            position=Position(left=GRID.TITLE_LEFT, top=7.10, width=8.0, height=0.25),
-            text=slide.title, font_size=8, font_color="dk2", alignment="left",
-        ))
+        # Footer breadcrumb: show key_message (not title) so there is no
+        # duplicate of the slide title at the bottom of every slide.
+        if slide.key_message:
+            shapes.append(ShapeSpec(
+                shape_type="text_box",
+                position=Position(left=GRID.TITLE_LEFT, top=7.10, width=8.0, height=0.25),
+                text=slide.key_message, font_size=9, font_color="dk2", alignment="left",
+            ))
 
         # Topic icon in top-right corner for visual identity
         topic_icon = _pick_icon(slide.title)
         if topic_icon != _DEFAULT_ICON:
-            self._icon_marker(shapes, GRID.SLIDE_WIDTH - 1.0, GRID.TITLE_TOP + 0.05,
+            self._icon_marker(shapes, GRID.SLIDE_WIDTH - 1.0, 0.43,
                               0.48, topic_icon, "accent2")
 
-        return y + 0.15
+        return GRID.MARGIN_TOP + 0.10  # content starts at ~1.50in
 
     # helper shortcuts
     def _line_h(self, shapes, left, top, width, color="lt2", weight=0.75):
@@ -270,7 +261,7 @@ class LayoutEngine:
             # Subtitle
             ShapeSpec(shape_type="text_box",
                       position=Position(left=0.375, top=4.2, width=6.6, height=0.8),
-                      text=slide.subtitle or "", font_size=16, font_color="dk2",
+                      text=slide.subtitle or "", font_size=14, font_color="dk2",
                       alignment="left", vertical_alignment="top"),
             # Decorative small squares at bottom
             ShapeSpec(shape_type="rectangle",
@@ -291,75 +282,50 @@ class LayoutEngine:
     # ═══════════════════════════════════════════════
 
     def _shapes_bullets(self, slide: OptimizedSlideContent) -> list[ShapeSpec]:
+        """Clean full-width numbered bullet layout.
+
+        Each row: accent circle (number) | gap | text — separator line spanning
+        both circle and text so everything has a consistent left/right edge.
+        """
         shapes = []
-        y = self._add_header(shapes, slide)  # ~5 shapes
+        y = self._add_header(shapes, slide)
 
         bullets = (slide.bullets or slide.agenda_items or [])[:5]
         if not bullets:
             return shapes
 
-        left, width = self.grid.span(0, 11)
-        item_h = 0.60
-        item_top = y + GAP
+        bl, bw = self.grid.span(0, 12)          # full content width
+        circle_size = 0.42                        # accent number circle
+        text_left   = bl + circle_size + 0.18    # text starts after circle + gap
+        text_width  = bw - circle_size - 0.18
 
-        # Pick a slide-level icon from the title
-        slide_icon = _pick_icon(slide.title)
+        available_h = 6.55 - y
+        item_h  = min(0.78, (available_h - 0.20) / max(len(bullets), 1))
+        row_gap = min(0.22, (available_h - len(bullets) * item_h) / max(len(bullets), 1))
+        item_top = y + 0.15
 
         for i, bullet in enumerate(bullets):
-            by = item_top + i * (item_h + 0.18)
-            accent = f"accent{(i % 6) + 1}"
+            by     = item_top + i * (item_h + row_gap)
+            accent = f"accent{(i % 4) + 1}"
+            cy     = by + (item_h - circle_size) / 2   # vertically centre circle in row
 
-            # Domain-aware icon marker (falls back to numbered if no match)
-            bullet_icon = _pick_icon(bullet)
-            if bullet_icon == _DEFAULT_ICON:
-                bullet_icon = slide_icon if slide_icon != _DEFAULT_ICON else str(i + 1)
-            self._icon_marker(shapes, left, by + 0.05, 0.42, bullet_icon, accent)
+            # Accent number circle — simple single digit, readable size
+            self._circle(shapes, bl, cy, circle_size, accent,
+                         str(i + 1), font_size=12)
 
-            # Bullet text
+            # Bullet text — vertically centred in same row height
             shapes.append(ShapeSpec(
                 shape_type="text_box",
-                position=Position(left=left + 0.55, top=by,
-                                  width=width - 0.65, height=item_h),
-                text=bullet, font_size=13, font_color="dk2",
+                position=Position(left=text_left, top=by,
+                                  width=text_width, height=item_h),
+                text=bullet, font_size=12, font_color="dk2",
                 alignment="left", vertical_alignment="middle",
             ))
 
-            # Separator line between bullets
+            # Separator line — spans full row width so circle & text share one edge
             if i < len(bullets) - 1:
-                self._line_h(shapes, left + 0.55, by + item_h + 0.07, width - 0.65)
-
-        # Right-side decorative accent block
-        rl, rw = self.grid.span(11, 1)
-        bullets_height = len(bullets) * (item_h + 0.18) - 0.1
-        shapes.append(ShapeSpec(
-            shape_type="rounded_rect",
-            position=Position(left=rl + 0.1, top=item_top, width=rw - 0.1, height=bullets_height),
-            fill_color="accent1",
-        ))
-
-        # ── Auto-fill: if bullets use less than ~60% of vertical space, add
-        #    a summary/highlight box below to fill the gap ──
-        used_bottom = item_top + bullets_height + 0.3
-        available_bottom = 6.8  # above footer
-        remaining = available_bottom - used_bottom
-
-        if remaining > 0.9 and slide.key_message:
-            fill_left, fill_w = self.grid.span(1, 10)
-            # Key takeaway highlight box
-            shapes.append(ShapeSpec(
-                shape_type="rounded_rect",
-                position=Position(left=fill_left, top=used_bottom,
-                                  width=fill_w, height=min(remaining - 0.2, 0.80)),
-                fill_color="lt2",
-            ))
-            self._accent_bar(shapes, fill_left, used_bottom, min(remaining - 0.2, 0.80), "accent1")
-            shapes.append(ShapeSpec(
-                shape_type="text_box",
-                position=Position(left=fill_left + 0.20, top=used_bottom + 0.08,
-                                  width=fill_w - 0.30, height=min(remaining - 0.35, 0.65)),
-                text=f"✦  {slide.key_message}", font_size=12, font_bold=True,
-                font_color="dk1", alignment="left", vertical_alignment="middle",
-            ))
+                sep_y = by + item_h + row_gap / 2
+                self._line_h(shapes, bl, sep_y, bw, "lt2", 0.75)
 
         return shapes
 
@@ -387,7 +353,7 @@ class LayoutEngine:
         ))
         shapes.append(ShapeSpec(
             shape_type="rectangle",
-            position=Position(left=13.10, top=y + GAP, width=0.06, height=chart_h + 0.2),
+            position=Position(left=GRID.SLIDE_WIDTH - 0.21, top=y + GAP, width=0.06, height=chart_h + 0.2),
             fill_color="accent2",
         ))
 
@@ -397,8 +363,10 @@ class LayoutEngine:
         self._line_h(shapes, chart_left, y + GAP + chart_h + 0.15, chart_w, "accent1", 1.0)
 
         # Small decorative squares at bottom-right
-        self._diamond(shapes, 12.5, 6.6, 0.12, "accent1")
-        self._diamond(shapes, 12.7, 6.6, 0.12, "accent3")
+        corner_x = GRID.SLIDE_WIDTH - 0.83
+        corner_y = GRID.SLIDE_HEIGHT - GRID.MARGIN_BOTTOM - 0.30
+        self._diamond(shapes, corner_x, corner_y, 0.12, "accent1")
+        self._diamond(shapes, corner_x + 0.20, corner_y, 0.12, "accent3")
 
         # Auto-fill: key message callout below chart if space allows
         chart_bottom = y + GAP + chart_h + 0.25
@@ -407,7 +375,7 @@ class LayoutEngine:
             shapes.append(ShapeSpec(
                 shape_type="text_box",
                 position=Position(left=kl, top=chart_bottom + 0.10, width=kw, height=0.45),
-                text=f"✦  {slide.key_message}", font_size=11, font_bold=True,
+                text=f"✦  {slide.key_message}", font_size=12, font_bold=True,
                 font_color="dk1", alignment="left", vertical_alignment="middle",
             ))
             self._line_h(shapes, kl, chart_bottom + 0.05, kw, "accent1", 1.0)
@@ -443,7 +411,7 @@ class LayoutEngine:
             shapes.append(ShapeSpec(
                 shape_type="text_box",
                 position=Position(left=left, top=table_bottom + 0.10, width=width, height=0.45),
-                text=f"✦  {slide.key_message}", font_size=11, font_bold=True,
+                text=f"✦  {slide.key_message}", font_size=12, font_bold=True,
                 font_color="dk1", alignment="left", vertical_alignment="middle",
             ))
 
@@ -495,11 +463,20 @@ class LayoutEngine:
             kpi_icon = _pick_icon(kpis[i].label)
             self._icon_marker(shapes, cl + cw / 2 - 0.25, card_top + 0.20, 0.50, kpi_icon, accent)
 
-            # Large KPI value
+            # Large KPI value — auto-scale font to prevent overflow for long values
+            val_text = kpis[i].value
+            if len(val_text) > 14:
+                val_font_size = 18
+            elif len(val_text) > 10:
+                val_font_size = 22
+            elif len(val_text) > 7:
+                val_font_size = 24
+            else:
+                val_font_size = 28
             shapes.append(ShapeSpec(
                 shape_type="text_box",
                 position=Position(left=cl + 0.1, top=card_top + 0.80, width=cw - 0.2, height=0.70),
-                text=kpis[i].value, font_size=28, font_bold=True,
+                text=val_text, font_size=val_font_size, font_bold=True,
                 font_color="dk1", alignment="center", vertical_alignment="middle",
             ))
 
@@ -510,7 +487,7 @@ class LayoutEngine:
             shapes.append(ShapeSpec(
                 shape_type="text_box",
                 position=Position(left=cl + 0.1, top=card_top + 1.65, width=cw - 0.2, height=0.70),
-                text=kpis[i].label, font_size=10, font_color="dk2",
+                text=kpis[i].label, font_size=9, font_color="dk2",
                 alignment="center", vertical_alignment="top",
             ))
 
@@ -526,7 +503,7 @@ class LayoutEngine:
                 shape_type="text_box",
                 position=Position(left=bleft, top=card_top + card_h + GAP * 2,
                                   width=bwidth, height=1.0),
-                text=bullet_text, font_size=11, font_color="dk2",
+                text=bullet_text, font_size=12, font_color="dk2",
             ))
 
         return shapes
@@ -564,7 +541,7 @@ class LayoutEngine:
             shapes.append(ShapeSpec(
                 shape_type="rounded_rect",
                 position=Position(left=x, top=step_top + 0.40, width=step_w - 0.1, height=step_h - 0.5),
-                text=steps[i].label, font_size=11, font_bold=True,
+                text=steps[i].label, font_size=12, font_bold=True,
                 font_color="dk1", fill_color="lt2",
                 alignment="center", vertical_alignment="middle",
             ))
@@ -626,7 +603,7 @@ class LayoutEngine:
             shapes.append(ShapeSpec(
                 shape_type="text_box",
                 position=Position(left=x - 0.8, top=line_y + 0.45, width=1.6, height=0.9),
-                text=items[i].label, font_size=10, font_color="dk2", alignment="center",
+                text=items[i].label, font_size=9, font_color="dk2", alignment="center",
             ))
 
         return shapes
@@ -692,7 +669,7 @@ class LayoutEngine:
                     shape_type="text_box",
                     position=Position(left=cl + PAD + 0.38, top=by,
                                       width=cw - PAD * 2 - 0.45, height=0.55),
-                    text=b, font_size=11, font_color="dk2",
+                    text=b, font_size=12, font_color="dk2",
                     alignment="left", vertical_alignment="middle",
                 ))
 
@@ -742,7 +719,7 @@ class LayoutEngine:
             shapes.append(ShapeSpec(
                 shape_type="text_box",
                 position=Position(left=cl, top=col_top + 0.58, width=cw, height=0.35),
-                text=item.title, font_size=13, font_bold=True,
+                text=item.title, font_size=14, font_bold=True,
                 font_color="dk1", alignment="center", vertical_alignment="middle",
             ))
 
@@ -761,7 +738,7 @@ class LayoutEngine:
                 shapes.append(ShapeSpec(
                     shape_type="text_box",
                     position=Position(left=cl + 0.30, top=py, width=cw - 0.35, height=0.60),
-                    text=point, font_size=11, font_color="dk2",
+                    text=point, font_size=12, font_color="dk2",
                     alignment="left", vertical_alignment="top",
                 ))
 
@@ -772,5 +749,312 @@ class LayoutEngine:
             # Vertical divider between columns
             if i < n - 1:
                 self._line_v(shapes, left + width, col_top + 0.1, body_h)
+
+        return shapes
+
+    # ═══════════════════════════════════════════════
+    # ICON GRID — 2×2 or 2×3 cards each with large icon + title + description
+    # Best for: 4–6 distinct categorised items (features, benefits, principles)
+    # ═══════════════════════════════════════════════
+
+    def _shapes_icon_grid(self, slide: OptimizedSlideContent) -> list[ShapeSpec]:
+        shapes = []
+        y = self._add_header(shapes, slide)
+
+        items = (slide.comparison_items or [])[:6]
+        n = len(items)
+        if n == 0:
+            return self._shapes_bullets(slide)
+
+        cols = 3 if n >= 5 else 2
+        rows = (n + cols - 1) // cols  # ceiling division
+
+        available_h = 6.45 - y
+        card_w = (GRID.content_width - (cols - 1) * GAP) / cols
+        card_h = (available_h - (rows - 1) * GAP) / rows
+
+        for i, item in enumerate(items):
+            col_idx = i % cols
+            row_idx = i // cols
+
+            cl = GRID.content_left + col_idx * (card_w + GAP)
+            ct = y + 0.05 + row_idx * (card_h + GAP)
+            accent = f"accent{(i % 6) + 1}"
+
+            # Card background
+            shapes.append(ShapeSpec(
+                shape_type="rounded_rect",
+                position=Position(left=cl, top=ct, width=card_w, height=card_h),
+                fill_color="lt2",
+            ))
+            # Top accent strip
+            shapes.append(ShapeSpec(
+                shape_type="rectangle",
+                position=Position(left=cl, top=ct, width=card_w, height=0.06),
+                fill_color=accent,
+            ))
+
+            # Centered icon circle
+            icon_size = min(card_h * 0.30, 0.52)
+            icon_left = cl + card_w / 2 - icon_size / 2
+            icon_top = ct + 0.14
+            self._icon_marker(shapes, icon_left, icon_top,
+                              icon_size, _pick_icon(item.title), accent)
+
+            # Title
+            title_top = icon_top + icon_size + 0.08
+            shapes.append(ShapeSpec(
+                shape_type="text_box",
+                position=Position(left=cl + 0.12, top=title_top,
+                                  width=card_w - 0.24, height=0.34),
+                text=item.title, font_size=12, font_bold=True,
+                font_color="dk1", alignment="center",
+            ))
+
+            # Thin accent separator under title
+            self._line_h(shapes, cl + 0.25, title_top + 0.37, card_w - 0.50, accent, 0.75)
+
+            # Description (first point)
+            if item.points:
+                desc_top = title_top + 0.43
+                remaining = card_h - (desc_top - ct) - 0.08
+                if remaining > 0.18:
+                    shapes.append(ShapeSpec(
+                        shape_type="text_box",
+                        position=Position(left=cl + 0.12, top=desc_top,
+                                          width=card_w - 0.24, height=remaining),
+                        text=item.points[0], font_size=9, font_color="dk2",
+                        alignment="center",
+                    ))
+
+            # Vertical separator between cards in the same row (not after last col)
+            if col_idx < cols - 1 and i < n - 1:
+                self._line_v(shapes, cl + card_w + GAP / 2, ct + 0.15, card_h - 0.30)
+
+        return shapes
+
+    # ═══════════════════════════════════════════════
+    # FUNNEL — stacked decreasing-width bars for pipeline / stage data
+    # Best for: sales funnels, hiring pipelines, adoption stages
+    # ═══════════════════════════════════════════════
+
+    def _shapes_funnel(self, slide: OptimizedSlideContent) -> list[ShapeSpec]:
+        shapes = []
+        y = self._add_header(shapes, slide)
+
+        items = (slide.funnel_items or [])[:5]
+        n = len(items)
+        if n == 0:
+            return self._shapes_bullets(slide)
+
+        cx = GRID.SLIDE_WIDTH / 2           # horizontal center of slide
+        max_w = GRID.content_width * 0.86   # widest bar
+        min_w = max_w * 0.28                # narrowest bar
+
+        bar_h = 0.68
+        total_bars_h = n * bar_h
+        gap = max(0.10, (6.30 - y - total_bars_h) / (n + 1))
+        bar_h = min(bar_h, (6.30 - y - (n + 1) * gap) / n)
+
+        for i, item in enumerate(items):
+            # Width linearly interpolated from max → min (top to bottom)
+            t = i / (n - 1) if n > 1 else 0.0
+            w = max_w - (max_w - min_w) * t
+            left = cx - w / 2
+            top = y + gap + i * (bar_h + gap)
+            accent = f"accent{(i % 6) + 1}"
+
+            # Funnel bar
+            shapes.append(ShapeSpec(
+                shape_type="rectangle",
+                position=Position(left=left, top=top, width=w, height=bar_h),
+                fill_color=accent,
+            ))
+
+            # Label centered inside bar
+            label_text = item.label
+            if item.value:
+                label_text = f"{item.label}  ·  {item.value}"
+            shapes.append(ShapeSpec(
+                shape_type="text_box",
+                position=Position(left=left + 0.12, top=top,
+                                  width=w - 0.24, height=bar_h),
+                text=label_text, font_size=14, font_bold=True,
+                font_color="lt1", alignment="center", vertical_alignment="middle",
+            ))
+
+            # Step number badge on left edge
+            self._circle(shapes, left - 0.32, top + bar_h / 2 - 0.18,
+                          0.36, accent, str(i + 1), 12)
+
+            # Small connector diamond between bars
+            if i < n - 1:
+                next_t = (i + 1) / (n - 1) if n > 1 else 0.0
+                next_w = max_w - (max_w - min_w) * next_t
+                diamond_w = max(next_w * 0.06, 0.14)
+                self._diamond(shapes, cx - diamond_w / 2,
+                               top + bar_h + gap / 2 - diamond_w / 2,
+                               diamond_w, accent)
+
+        # Right-side annotation: value labels if present and we haven't already inline'd them
+        if any(item.value for item in items):
+            for i, item in enumerate(items):
+                if not item.value:
+                    continue
+                t = i / (n - 1) if n > 1 else 0.0
+                w = max_w - (max_w - min_w) * t
+                bar_right = cx + w / 2
+                top = y + gap + i * (bar_h + gap)
+                if bar_right + 0.20 < GRID.SLIDE_WIDTH - 0.20:
+                    shapes.append(ShapeSpec(
+                        shape_type="text_box",
+                        position=Position(left=bar_right + 0.10, top=top,
+                                          width=1.50, height=bar_h),
+                        text=item.value, font_size=12, font_bold=True,
+                        font_color=f"accent{(i % 6) + 1}",
+                        alignment="left", vertical_alignment="middle",
+                    ))
+
+        return shapes
+
+    # ═══════════════════════════════════════════════
+    # COMPARISON CARDS — VS badge + two feature cards with check marks
+    # Best for: option A vs option B, before vs after, method comparisons
+    # ═══════════════════════════════════════════════
+
+    def _shapes_comparison_cards(self, slide: OptimizedSlideContent) -> list[ShapeSpec]:
+        shapes = []
+        y = self._add_header(shapes, slide)
+
+        items = (slide.comparison_items or [])[:2]
+        if len(items) < 2:
+            return self._shapes_two_column(slide)
+
+        card_h = min(4.80, 6.30 - y)
+        # Split content width: two cards with ~1.4" gap for VS badge
+        badge_gap = 1.40
+        card_w = (GRID.content_width - badge_gap) / 2
+        card_top = y + 0.15
+
+        left_x = GRID.content_left
+        right_x = GRID.content_left + card_w + badge_gap
+        badge_cx = GRID.content_left + card_w + badge_gap / 2   # center of gap
+        accents = ["accent1", "accent2"]
+
+        for ci, (cx, item) in enumerate(zip([left_x, right_x], items)):
+            accent = accents[ci]
+            header_h = 0.68
+
+            # Card shadow/background
+            shapes.append(ShapeSpec(
+                shape_type="rounded_rect",
+                position=Position(left=cx, top=card_top, width=card_w, height=card_h),
+                fill_color="lt2",
+            ))
+            # Coloured header banner
+            shapes.append(ShapeSpec(
+                shape_type="rounded_rect",
+                position=Position(left=cx, top=card_top, width=card_w, height=header_h),
+                fill_color=accent,
+            ))
+            # Domain icon in header (left-aligned)
+            col_icon = _pick_icon(item.title)
+            self._icon_marker(shapes, cx + 0.10, card_top + 0.10, 0.46, col_icon, accent)
+            # Header title
+            shapes.append(ShapeSpec(
+                shape_type="text_box",
+                position=Position(left=cx + 0.66, top=card_top + 0.12,
+                                  width=card_w - 0.76, height=0.44),
+                text=item.title, font_size=14, font_bold=True,
+                font_color="lt1", alignment="left", vertical_alignment="middle",
+            ))
+
+            # Feature points with check-mark circles
+            for j, point in enumerate(item.points[:4]):
+                py = card_top + header_h + 0.14 + j * 0.76
+
+                # Check mark
+                self._circle(shapes, cx + 0.12, py + 0.12, 0.28, accent, "✓", 10)
+
+                # Point text
+                shapes.append(ShapeSpec(
+                    shape_type="text_box",
+                    position=Position(left=cx + 0.52, top=py,
+                                      width=card_w - 0.62, height=0.66),
+                    text=point, font_size=12, font_color="dk2",
+                    alignment="left", vertical_alignment="middle",
+                ))
+
+                # Separator line (not after last point)
+                if j < len(item.points[:4]) - 1:
+                    self._line_h(shapes, cx + 0.12, py + 0.70,
+                                  card_w - 0.24, "lt2", 0.5)
+
+        # VS badge centered in the gap
+        vs_size = 0.78
+        vs_x = badge_cx - vs_size / 2
+        vs_y = card_top + card_h / 2 - vs_size / 2
+        shapes.append(ShapeSpec(
+            shape_type="oval",
+            position=Position(left=vs_x, top=vs_y, width=vs_size, height=vs_size),
+            text="VS", font_size=14, font_bold=True,
+            font_color="lt1", fill_color="dk2",
+            alignment="center", vertical_alignment="middle",
+        ))
+
+        return shapes
+
+    # ═══════════════════════════════════════════════
+    # SECTION DIVIDER — bold full-slide break between major sections
+    # Uses the "C_Section blue" template layout which provides a dark background.
+    # All text here must be white/light to read against the dark template.
+    # ═══════════════════════════════════════════════
+
+    def _shapes_divider(self, slide: OptimizedSlideContent) -> list[ShapeSpec]:
+        shapes: list[ShapeSpec] = []
+
+        cx = GRID.SLIDE_WIDTH / 2
+        cy = GRID.SLIDE_HEIGHT / 2
+
+        # Full-width accent bar just above center — matches sample's horizontal line
+        self._line_h(shapes, 0.40, cy - 0.72, GRID.SLIDE_WIDTH - 0.80, "accent1", 2.5)
+
+        # Large section title (white on dark template background)
+        shapes.append(ShapeSpec(
+            shape_type="text_box",
+            position=Position(left=0.43, top=cy - 0.60, width=9.50, height=1.10),
+            text=slide.title, font_size=40, font_bold=True,
+            font_color="lt1", alignment="left",
+        ))
+
+        # Subtitle / key message
+        if slide.key_message:
+            shapes.append(ShapeSpec(
+                shape_type="text_box",
+                position=Position(left=0.43, top=cy + 0.60, width=9.50, height=0.55),
+                text=slide.key_message, font_size=18, font_bold=False,
+                font_color="lt2", alignment="left",
+            ))
+
+        # Thin line below title
+        self._line_h(shapes, 0.40, cy + 0.52, 8.0, "lt2", 0.75)
+
+        # Left accent bar (full height, narrow) — mirrors the sample's left strip
+        shapes.append(ShapeSpec(
+            shape_type="rectangle",
+            position=Position(left=0.00, top=0.25, width=0.22, height=5.58),
+            fill_color="accent1",
+        ))
+
+        # Section-number badge (accent-colored circle, top-right quadrant)
+        topic_icon = _pick_icon(slide.title)
+        self._icon_marker(shapes, GRID.SLIDE_WIDTH - 2.20, cy - 1.10,
+                          1.10, topic_icon, "accent2")
+
+        # Three decorative dots at bottom-right (matches sample's corner squares)
+        corner_x = GRID.SLIDE_WIDTH - 0.80
+        corner_y = GRID.SLIDE_HEIGHT - 0.35
+        for i, accent in enumerate(["accent1", "accent2", "accent3"]):
+            self._diamond(shapes, corner_x + i * 0.22, corner_y, 0.14, accent)
 
         return shapes

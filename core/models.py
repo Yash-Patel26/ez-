@@ -69,7 +69,8 @@ VISUAL_TREATMENTS = Literal[
     "bullets", "two_column", "three_column",
     "chart_bar", "chart_pie", "chart_line", "chart_area", "chart_stacked_bar",
     "table", "process_flow", "timeline", "kpi_cards",
-    "comparison_cards", "icon_grid", "cover_layout", "closing_layout"
+    "comparison_cards", "icon_grid", "funnel",
+    "cover_layout", "closing_layout", "divider_layout"
 ]
 
 
@@ -148,6 +149,13 @@ class ProcessStep(BaseModel):
     description: str = ""
 
 
+class FunnelItem(BaseModel):
+    """A single stage in a funnel / pipeline diagram."""
+    label: str
+    value: str = ""        # e.g. "1,200 leads", "42%"
+    description: str = ""
+
+
 class OptimizedSlideContent(BaseModel):
     """Fully optimized content ready for rendering on a single slide."""
     slide_number: int
@@ -168,6 +176,7 @@ class OptimizedSlideContent(BaseModel):
     timeline_items: list[TimelineItem] | None = None
     comparison_items: list[ComparisonItem] | None = None
     agenda_items: list[str] | None = None
+    funnel_items: list[FunnelItem] | None = None
 
 
 # ──────────────────────────────────────────────

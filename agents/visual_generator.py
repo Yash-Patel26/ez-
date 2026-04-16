@@ -102,6 +102,47 @@ def _resolve_color(color_ref: str, theme: ThemeConfig) -> RGBColor:
     return RGBColor(0, 0, 0)
 
 
+_C_NS = "http://schemas.openxmlformats.org/drawingml/2006/chart"
+_A_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
+
+
+def _set_white_fill_xml(parent_elem) -> None:
+    """Inject <c:spPr> with a solid white fill and no border into a chart XML element.
+
+    python-pptx 1.x does not expose chart_area / plot_area as Python objects,
+    so we manipulate the underlying lxml element directly.
+    The resulting XML fragment:
+        <c:spPr>
+          <a:solidFill><a:srgbClr val="FFFFFF"/></a:solidFill>
+          <a:ln><a:noFill/></a:ln>
+        </c:spPr>
+    """
+    from lxml import etree
+
+    # Remove any existing spPr to avoid duplicates
+    existing = parent_elem.find(f"{{{_C_NS}}}spPr")
+    if existing is not None:
+        parent_elem.remove(existing)
+
+    spPr = etree.SubElement(parent_elem, f"{{{_C_NS}}}spPr")
+    solidFill = etree.SubElement(spPr, f"{{{_A_NS}}}solidFill")
+    srgbClr = etree.SubElement(solidFill, f"{{{_A_NS}}}srgbClr")
+    srgbClr.set("val", "FFFFFF")
+    ln = etree.SubElement(spPr, f"{{{_A_NS}}}ln")
+    etree.SubElement(ln, f"{{{_A_NS}}}noFill")
+
+
+def _disable_line_smoothing(chart) -> None:
+    """Set smooth=0 on every line series to prevent bezier blurring."""
+    from lxml import etree
+
+    for ser_elem in chart.plots[0]._element.iter(f"{{{_C_NS}}}ser"):
+        smooth_elem = ser_elem.find(f"{{{_C_NS}}}smooth")
+        if smooth_elem is None:
+            smooth_elem = etree.SubElement(ser_elem, f"{{{_C_NS}}}smooth")
+        smooth_elem.set("val", "0")
+
+
 class VisualGenerator:
     """Generate visual elements on slides using python-pptx."""
 
@@ -109,6 +150,36 @@ class VisualGenerator:
         self.theme = theme
         self.config = config or {}
         self.accent_colors = theme.colors.accent_list()
+        # Chart colors: prefer darker, more visible accent colors.
+        # Some templates use near-white colors for accent1/4 (background accents).
+        # Sort by relative luminance ascending so the darkest colors come first.
+        self._chart_colors = self._build_chart_colors()
+
+    def _build_chart_colors(self) -> list[str]:
+        """Return accent colors sorted darkest-first, with near-white colors filtered out.
+
+        Some templates use near-white hex values for accent1/accent4 as layout
+        background tints.  Those colors produce invisible bars on a white chart
+        background.  We sort by relative luminance (ascending) and drop any color
+        whose luminance stays above 0.70 even after the saturation boost.
+        """
+        _FALLBACK = ["#2563EB", "#DC2626", "#16A34A", "#D97706", "#7C3AED", "#0891B2"]
+
+        def _lum(hex_color: str) -> float:
+            h = hex_color.lstrip('#')
+            r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+            r2, g2, b2 = _boost_saturation(r, g, b)
+            return (0.299 * r2 + 0.587 * g2 + 0.114 * b2) / 255.0
+
+        sorted_colors = sorted(self.accent_colors, key=_lum)
+        # Keep only colors that are dark enough to be visible on white
+        visible = [c for c in sorted_colors if _lum(c) < 0.70]
+        if not visible:
+            return _FALLBACK
+        # Pad with fallbacks if fewer than 3 visible accent colors
+        if len(visible) < 3:
+            visible = visible + [c for c in _FALLBACK if c not in visible]
+        return visible
 
     def add_chart(
         self, slide, chart_data: ChartData, position: ShapeSpec
@@ -143,6 +214,20 @@ class VisualGenerator:
 
         chart = chart_shape.chart
 
+        # Solid white backgrounds via XML — python-pptx 1.x does not expose
+        # chart_area / plot_area as objects, so we inject <c:spPr> directly.
+        # This prevents slide gradient / image bleeding through the chart frame,
+        # which is the primary cause of the "blurred" chart appearance.
+        cs = chart._chartSpace
+        _set_white_fill_xml(cs)   # chart area (outer frame)
+
+        if chart_data.chart_type != "pie":
+            plot_area = cs.find(
+                f"{{{_C_NS}}}chart"
+            ).find(f"{{{_C_NS}}}plotArea")
+            if plot_area is not None:
+                _set_white_fill_xml(plot_area)
+
         # Chart title if provided
         if chart_data.title:
             chart.has_title = True
@@ -159,11 +244,18 @@ class VisualGenerator:
             chart.legend.include_in_layout = False
             chart.legend.font.size = Pt(9)
 
-        # Style the chart with theme colors
+        # Style the chart with theme colors (darkest/most visible first)
         for i, series in enumerate(chart.series):
-            color = self.accent_colors[i % len(self.accent_colors)]
-            series.format.fill.solid()
-            series.format.fill.fore_color.rgb = _hex_to_rgb(color)
+            color = self._chart_colors[i % len(self._chart_colors)]
+            rgb_color = _hex_to_rgb(color)
+
+            if chart_data.chart_type in ("line",):
+                # Line charts: set line color + weight; fill doesn't apply to lines
+                series.format.line.color.rgb = rgb_color
+                series.format.line.width = Pt(2.25)  # crisp, visible line
+            else:
+                series.format.fill.solid()
+                series.format.fill.fore_color.rgb = rgb_color
 
             # Add data labels for all chart types
             series.has_data_labels = True
@@ -177,15 +269,26 @@ class VisualGenerator:
             elif chart_data.chart_type in ("line", "area"):
                 series.data_labels.label_position = XL_LABEL_POSITION.ABOVE
 
+        # Disable bezier smoothing on line charts — smooth curves look blurry/imprecise
+        if chart_data.chart_type == "line":
+            _disable_line_smoothing(chart)
+
         # Style axes if present
         if chart_data.chart_type != "pie":
             try:
                 cat_axis = chart.category_axis
                 cat_axis.tick_labels.font.size = Pt(9)
+                _axis_color = _resolve_color("lt2", self.theme)
+                cat_axis.format.line.color.rgb = _axis_color
+                cat_axis.format.line.width = Pt(0.75)
+
                 val_axis = chart.value_axis
                 val_axis.tick_labels.font.size = Pt(9)
                 val_axis.has_major_gridlines = True
                 val_axis.major_gridlines.format.line.color.rgb = _hex_to_rgb(self.theme.colors.lt2)
+                val_axis.major_gridlines.format.line.width = Pt(0.5)
+                val_axis.format.line.color.rgb = _axis_color
+                val_axis.format.line.width = Pt(0.75)
             except Exception:
                 pass
 
@@ -235,13 +338,13 @@ class VisualGenerator:
                 trend_arrow = self._detect_trend_indicator(raw_text)
                 cell.text = f"{trend_arrow} {raw_text}" if trend_arrow else raw_text
 
-                # Alternating row colors
+                # Alternating row colors — use theme lt1/lt2 instead of hardcoded grays
                 if row_idx % 2 == 0:
                     cell.fill.solid()
-                    cell.fill.fore_color.rgb = RGBColor(245, 245, 245)
+                    cell.fill.fore_color.rgb = _hex_to_rgb(self.theme.colors.lt2)
                 else:
                     cell.fill.solid()
-                    cell.fill.fore_color.rgb = RGBColor(255, 255, 255)
+                    cell.fill.fore_color.rgb = _hex_to_rgb(self.theme.colors.lt1)
 
                 # Common Mistake #15: Text should be middle-aligned in tables
                 cell.vertical_anchor = MSO_ANCHOR.MIDDLE
@@ -249,11 +352,11 @@ class VisualGenerator:
                     paragraph.font.size = Pt(10)
                     paragraph.alignment = PP_ALIGN.CENTER
 
-                    # Color-code cells with trend indicators
+                    # Color-code cells with trend indicators using theme accent colors
                     if trend_arrow == "▲":
-                        paragraph.font.color.rgb = RGBColor(22, 163, 74)  # green
+                        paragraph.font.color.rgb = _resolve_color("accent3", self.theme)
                     elif trend_arrow == "▼":
-                        paragraph.font.color.rgb = RGBColor(220, 38, 38)  # red
+                        paragraph.font.color.rgb = _resolve_color("accent1", self.theme)
                     else:
                         paragraph.font.color.rgb = _hex_to_rgb(self.theme.colors.dk2)
 
@@ -307,10 +410,15 @@ class VisualGenerator:
             self._format_shape(shape, spec, theme)
 
         elif spec.shape_type == "line":
-            # Horizontal line
-            shape = slide.shapes.add_shape(
-                MSO_SHAPE.RECTANGLE, left, top, width, Inches(0.03)
-            )
+            # Vertical line when width == 0, horizontal otherwise
+            if spec.position.width == 0:
+                shape = slide.shapes.add_shape(
+                    MSO_SHAPE.RECTANGLE, left, top, Inches(0.03), height
+                )
+            else:
+                shape = slide.shapes.add_shape(
+                    MSO_SHAPE.RECTANGLE, left, top, width, Inches(0.03)
+                )
             if spec.font_color:
                 shape.fill.solid()
                 shape.fill.fore_color.rgb = _resolve_color(spec.font_color, theme)
