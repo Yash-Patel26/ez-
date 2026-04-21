@@ -86,6 +86,7 @@ def _resolve_color(color_ref: str, theme: ThemeConfig) -> RGBColor:
         "accent4": theme.colors.accent4,
         "accent5": theme.colors.accent5,
         "accent6": theme.colors.accent6,
+        "primary": theme.colors.primary_accent(theme.primary_accent_seed),
     }
 
     if color_ref in theme_map:
@@ -104,6 +105,29 @@ def _resolve_color(color_ref: str, theme: ThemeConfig) -> RGBColor:
 
 _C_NS = "http://schemas.openxmlformats.org/drawingml/2006/chart"
 _A_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
+
+
+def _enable_shrink_to_fit(text_frame) -> None:
+    """Enable PowerPoint's 'Shrink text on overflow' on a text frame.
+
+    Layout engine already picks font sizes that fit the estimated text
+    length, but glyph widths vary and some bullets may still overflow.
+    normAutofit tells PowerPoint to auto-scale the text at render time so
+    content never clips out of the box — this is the in-product 'auto-fit'
+    behaviour you get by right-clicking → Size & Properties → Shrink text
+    on overflow.
+    """
+    from lxml import etree
+
+    bodyPr = text_frame._txBody.find(f"{{{_A_NS}}}bodyPr")
+    if bodyPr is None:
+        return
+    # Remove any existing autofit element before adding normAutofit
+    for tag in ("normAutofit", "spAutoFit", "noAutofit"):
+        existing = bodyPr.find(f"{{{_A_NS}}}{tag}")
+        if existing is not None:
+            bodyPr.remove(existing)
+    etree.SubElement(bodyPr, f"{{{_A_NS}}}normAutofit")
 
 
 def _set_white_fill_xml(parent_elem) -> None:
@@ -320,7 +344,7 @@ class VisualGenerator:
             cell = table.cell(0, i)
             cell.text = header
             cell.fill.solid()
-            cell.fill.fore_color.rgb = _hex_to_rgb(self.theme.colors.accent1)
+            cell.fill.fore_color.rgb = _hex_to_rgb(self.theme.colors.primary_accent(self.theme.primary_accent_seed))
 
             for paragraph in cell.text_frame.paragraphs:
                 paragraph.font.size = Pt(11)
@@ -397,6 +421,7 @@ class VisualGenerator:
         if spec.shape_type == "text_box":
             txBox = slide.shapes.add_textbox(left, top, width, height)
             self._format_textbox(txBox, spec, theme)
+            _enable_shrink_to_fit(txBox.text_frame)
 
         elif spec.shape_type in ("rounded_rect", "rectangle"):
             shape_type = (MSO_SHAPE.ROUNDED_RECTANGLE
@@ -470,6 +495,17 @@ class VisualGenerator:
         tf = txBox.text_frame
         tf.word_wrap = True
 
+        # Vertical anchor — default text_frame is top-aligned, so bullet rows
+        # where the label is centred with a number circle would drift to the top
+        # of their box. Honour the spec's vertical_alignment.
+        anchor_map = {
+            "top": MSO_ANCHOR.TOP,
+            "middle": MSO_ANCHOR.MIDDLE,
+            "bottom": MSO_ANCHOR.BOTTOM,
+        }
+        if spec.vertical_alignment in anchor_map:
+            tf.vertical_anchor = anchor_map[spec.vertical_alignment]
+
         # Common Mistake #14: "No margins within text boxes without fill color"
         # Only add internal margins if the text box has a fill color
         if spec.fill_color:
@@ -542,12 +578,23 @@ class VisualGenerator:
         if spec.text:
             tf = shape.text_frame
             tf.word_wrap = True
+            _enable_shrink_to_fit(tf)
 
             # Internal padding (Guideline 5: breathing space)
             tf.margin_left = Inches(0.12)
             tf.margin_right = Inches(0.12)
             tf.margin_top = Inches(0.08)
             tf.margin_bottom = Inches(0.08)
+
+            anchor_map = {
+                "top": MSO_ANCHOR.TOP,
+                "middle": MSO_ANCHOR.MIDDLE,
+                "bottom": MSO_ANCHOR.BOTTOM,
+            }
+            if spec.vertical_alignment in anchor_map:
+                tf.vertical_anchor = anchor_map[spec.vertical_alignment]
+            else:
+                tf.vertical_anchor = MSO_ANCHOR.MIDDLE
 
             lines = spec.text.split('\n')
             for i, line in enumerate(lines):

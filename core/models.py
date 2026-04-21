@@ -242,6 +242,37 @@ class ThemeColors(BaseModel):
         return [self.accent1, self.accent2, self.accent3,
                 self.accent4, self.accent5, self.accent6]
 
+    def primary_accent(self, seed: str = "") -> str:
+        """Return a primary accent that visibly differs across templates.
+
+        Hackathon templates often share 5 of 6 accents — the *only* slot that
+        differs is accent2 (e.g. Accenture's orange #E97132 vs AI Bubble's pale
+        blue #DCDEF3). Hashing on the shared palette inevitably collides.
+        Rule: use accent2 as the primary since it's the palette's
+        differentiator. If it's too pale to read on a white background, darken
+        it to a readable luminance while preserving hue and saturation so the
+        template's intended color family still comes through.
+        """
+        import colorsys
+
+        c = self.accent2
+        h = c.lstrip("#")
+        r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+
+        hh, ss, vv = colorsys.rgb_to_hsv(r / 255, g / 255, b / 255)
+        # Re-cast only if the color is truly washed out — pale (high value)
+        # AND low-sat, like #DCDEF3. Vibrant colors like #E97132 (V=0.91,
+        # S=0.79) must pass through unchanged so the template's intended
+        # hue stays faithful.
+        if (vv > 0.85 and ss < 0.50) or ss < 0.20:
+            ss = max(ss, 0.70)
+            vv = 0.55
+            r2, g2, b2 = colorsys.hsv_to_rgb(hh, ss, vv)
+            return "#{:02X}{:02X}{:02X}".format(
+                int(r2 * 255), int(g2 * 255), int(b2 * 255)
+            )
+        return c
+
 
 class ThemeFonts(BaseModel):
     """Font families from Slide Master theme."""
@@ -255,3 +286,10 @@ class ThemeConfig(BaseModel):
     fonts: ThemeFonts = Field(default_factory=ThemeFonts)
     slide_width: float = 13.333
     slide_height: float = 7.5
+    # Seed for primary_accent rotation — template path at extraction time so
+    # different templates with similar palettes still pick distinct hues.
+    primary_accent_seed: str = ""
+    # Structural style variant — varies KPI card shape, icon marker shape,
+    # header accent, and numbered-bullet style so decks from different
+    # templates are visually distinct beyond just color.
+    style_variant: Literal["classic", "banded", "underline"] = "classic"

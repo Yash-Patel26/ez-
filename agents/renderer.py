@@ -20,7 +20,9 @@ from __future__ import annotations
 from pathlib import Path
 
 from pptx import Presentation
-from pptx.util import Inches, Pt
+from pptx.dml.color import RGBColor
+from pptx.enum.shapes import PP_PLACEHOLDER
+from pptx.util import Emu, Inches, Pt
 from pptx.enum.text import PP_ALIGN
 
 from agents.visual_generator import VisualGenerator, _resolve_color
@@ -30,6 +32,67 @@ from core.models import (
     SlideLayout,
     ThemeConfig,
 )
+
+
+def _A(tag: str) -> str:
+    return f"{{http://schemas.openxmlformats.org/drawingml/2006/main}}{tag}"
+
+
+def _placeholder_over_dark(slide, ph) -> bool:
+    """Return True if a dark-filled shape in the layout covers the placeholder."""
+    left = ph.left or 0
+    top = ph.top or 0
+    right = left + (ph.width or 0)
+    bottom = top + (ph.height or 0)
+    for sh in slide.slide_layout.shapes:
+        try:
+            sh_left = sh.left or 0
+            sh_top = sh.top or 0
+            sh_right = sh_left + (sh.width or 0)
+            sh_bottom = sh_top + (sh.height or 0)
+            if sh_left > left or sh_top > top or sh_right < right or sh_bottom < bottom:
+                continue
+            rgb = sh.fill.fore_color.rgb
+        except Exception:
+            continue
+        r, g, b = rgb[0], rgb[1], rgb[2]
+        if (r * 0.299 + g * 0.587 + b * 0.114) < 128:
+            return True
+    return False
+
+
+def _read_layout_title_style(slide, idx: int) -> tuple[int | None, RGBColor | None]:
+    """Extract the layout placeholder's intended font size (pt) and RGB color.
+
+    Looks in rPr and lstStyle defRPr. Returns (None, None) if not defined —
+    caller then falls back to config defaults.
+    """
+    layout = slide.slide_layout
+    target = None
+    for lp in layout.placeholders:
+        try:
+            if lp.placeholder_format.idx == idx:
+                target = lp
+                break
+        except Exception:
+            continue
+    if target is None:
+        return None, None
+
+    size_pt: int | None = None
+    color: RGBColor | None = None
+
+    for el in target._element.iter():
+        if el.tag in (_A("rPr"), _A("defRPr")):
+            sz = el.get("sz")
+            if sz and size_pt is None:
+                size_pt = int(sz) // 100
+            for child in el:
+                if child.tag == _A("solidFill") and color is None:
+                    rgb_el = child.find(_A("srgbClr"))
+                    if rgb_el is not None and rgb_el.get("val"):
+                        color = RGBColor.from_string(rgb_el.get("val"))
+    return size_pt, color
 
 
 class PPTXRenderer:
@@ -64,6 +127,11 @@ class PPTXRenderer:
 
         # Remove existing slides from template (keep only layouts/master)
         self._remove_existing_slides(prs)
+
+        # Strip prompt/citation text from layout placeholders so empty slide-
+        # level placeholders don't render the layout's baked-in text
+        # (e.g. 'Source', 'Click to edit Master title style').
+        self._scrub_layout_prompt_text(prs)
 
         # Build a layout name → layout object mapping
         layout_map = self._build_layout_map(prs)
@@ -181,19 +249,48 @@ class PPTXRenderer:
         """Render the cover slide using template placeholders + decorative shapes."""
         placeholders = list(slide.placeholders)
 
+        # ph.text wipes layout run-level rPr. Preserve the layout's intended
+        # size/color for the cover so it stays visible on the template's bg.
+        title_fallback = int(self.config.get("typography", {}).get("cover_title_size", 32))
+        subtitle_fallback = int(self.config.get("typography", {}).get("cover_subtitle_size", 16))
+
+        def _apply(ph, text, is_title, fallback_size):
+            layout_idx = ph.placeholder_format.idx
+            layout_size, layout_color = _read_layout_title_style(slide, layout_idx)
+            # Guarantee contrast — if layout says white text but no dark bg shape
+            # sits behind the placeholder, swap to dk1 so it's not invisible.
+            if (
+                layout_color
+                and layout_color == RGBColor(0xFF, 0xFF, 0xFF)
+                and not _placeholder_over_dark(slide, ph)
+            ):
+                layout_color = _resolve_color("dk1", self.theme)
+            final_color = layout_color or _resolve_color(
+                "dk1" if is_title else "dk2", self.theme
+            )
+            final_size = layout_size or fallback_size
+
+            ph.text = text
+            tf = ph.text_frame
+            tf.margin_left = 0
+            tf.margin_right = 0
+            tf.margin_top = 0
+            tf.margin_bottom = 0
+            tf.word_wrap = True
+            for para in tf.paragraphs:
+                para.font.name = (
+                    self.theme.fonts.major if is_title else self.theme.fonts.minor
+                )
+                para.font.size = Pt(final_size)
+                para.font.bold = is_title
+                para.font.color.rgb = final_color
+
         if len(placeholders) >= 2:
-            placeholders[0].text = content.title or ""
+            _apply(placeholders[0], content.title or "", True, title_fallback)
             if content.subtitle:
-                placeholders[1].text = content.subtitle or ""
-            for ph in placeholders:
-                ph.text_frame.margin_left = 0
-                ph.text_frame.margin_right = 0
-                ph.text_frame.margin_top = 0
-                ph.text_frame.margin_bottom = 0
-                for para in ph.text_frame.paragraphs:
-                    para.font.name = self.theme.fonts.major
+                _apply(placeholders[1], content.subtitle, False, subtitle_fallback)
         elif len(placeholders) == 1:
-            placeholders[0].text = content.title or ""
+            _apply(placeholders[0], content.title or "", True, title_fallback)
         else:
             # No placeholders — add text boxes
             txBox = slide.shapes.add_textbox(
@@ -238,6 +335,13 @@ class PPTXRenderer:
             for sh in slide.slide_layout.shapes
             if sh.has_text_frame
         )
+        # Some templates (e.g. AI Bubble) render 'Thank you' as a vector
+        # shape/picture rather than live text. Trust the layout name in that
+        # case so we don't stamp a duplicate textbox on top of the artwork.
+        if not layout_has_thankyou:
+            layout_name = (slide.slide_layout.name or "").lower()
+            if "thank you" in layout_name or "thankyou" in layout_name:
+                layout_has_thankyou = True
         if layout_has_thankyou:
             # Template provides the text — nothing to add
             return
@@ -271,41 +375,148 @@ class PPTXRenderer:
         """Render a section-divider slide.
 
         The C_Section blue template layout provides the dark background.
-        We only add our decorative shapes on top — no placeholder text is set
-        so the template's own look is preserved cleanly.
+        We populate the title placeholder so PowerPoint's outline/sorter views
+        show the section name correctly, then add decorative shapes on top.
         """
+        filled = self._populate_placeholders(slide, content.title)
+        self._strip_unused_placeholders(slide, keep_idxs=filled)
         for spec in layout.shapes:
             self.visual_gen.add_shape(slide, spec, self.theme)
 
-    def _populate_placeholders(self, slide, title: str, subtitle: str = "") -> None:
-        """Set title and subtitle template placeholders using the template's own fonts.
+    def _scrub_layout_prompt_text(self, prs) -> None:
+        """Empty out literal prompt/citation text on layout placeholders.
 
-        Using placeholders ensures the slide master's font, size, and positioning
-        are respected — giving consistent rendering across templates.
+        Some templates bake prompt text directly into layout placeholders
+        (e.g. Accenture's 'Title only' layout has 'Click to edit Master title
+        style' on the title PH and 'Source' on a body PH). When a slide using
+        that layout leaves the PH empty, PowerPoint renders the *layout*'s
+        text as a fallback — bleeding the prompt through on every slide.
+        Clearing the layout's placeholder text fixes the bleed-through for
+        every slide in one pass without changing the master.
         """
+        for layout in prs.slide_layouts:
+            for ph in layout.placeholders:
+                if not ph.has_text_frame:
+                    continue
+                try:
+                    ptype = ph.placeholder_format.type
+                except Exception:
+                    ptype = None
+                # Leave slide-number / footer / date untouched — these
+                # legitimately carry auto-filled values like '<#>' or dates.
+                if ptype in (
+                    PP_PLACEHOLDER.SLIDE_NUMBER,
+                    PP_PLACEHOLDER.FOOTER,
+                    PP_PLACEHOLDER.DATE,
+                ):
+                    continue
+                # Clear text by replacing the <a:txBody> paragraphs with a
+                # single empty paragraph. ph.text = "" triggers the python-
+                # pptx autoclean path that preserves defRPr style but removes
+                # run-level text, which is what we want.
+                ph.text_frame.clear()
+                try:
+                    ph.text_frame.paragraphs[0].text = ""
+                except Exception:
+                    pass
+
+    def _strip_unused_placeholders(self, slide, keep_idxs: set[int]) -> None:
+        """Remove placeholders whose inherited layout text would show through.
+
+        Layouts like Accenture's 'Title only' carry a 'Source' body placeholder
+        (idx 11) and 'Click to edit Master title style' prompts. When the slide's
+        placeholder is empty, PowerPoint renders the layout's text — overlapping
+        the content shapes we add on top. Remove every placeholder we're not
+        populating, except slide-number / footer / date (harmless chrome).
+        """
+        keep_types = {
+            PP_PLACEHOLDER.SLIDE_NUMBER,
+            PP_PLACEHOLDER.FOOTER,
+            PP_PLACEHOLDER.DATE,
+        }
+        to_remove = []
         for ph in slide.placeholders:
             try:
                 idx = ph.placeholder_format.idx
+                ptype = ph.placeholder_format.type
+            except Exception:
+                continue
+            if idx in keep_idxs or ptype in keep_types:
+                continue
+            to_remove.append(ph)
+
+        for ph in to_remove:
+            sp = ph._element
+            parent = sp.getparent()
+            if parent is not None:
+                parent.remove(sp)
+
+    def _populate_placeholders(self, slide, title: str, subtitle: str = "") -> set[int]:
+        """Set title and subtitle template placeholders.
+
+        ph.text wipes the layout's run-level rPr (size, color), so the text
+        falls back to master style defaults — typically 44pt title, which
+        overflows a 0.57in title band. Read the layout's intended size/color
+        first, then re-apply them explicitly. Size is also clamped to fit the
+        placeholder's height so long titles never overflow or wrap into the
+        header divider line.
+
+        Returns the set of placeholder idxs that got populated — the caller
+        uses this to know which placeholders to keep vs strip.
+        """
+        title_fallback = int(self.config.get("typography", {}).get("title_size", 28))
+        subtitle_fallback = int(self.config.get("typography", {}).get("subtitle_size", 13))
+
+        filled: set[int] = set()
+
+        for ph in slide.placeholders:
+            try:
+                idx = ph.placeholder_format.idx
+                ptype = ph.placeholder_format.type
             except Exception:
                 continue
 
+            is_subtitle_ph = idx == 1 or ptype == PP_PLACEHOLDER.SUBTITLE
+
             if idx == 0 and title:
+                layout_size, layout_color = _read_layout_title_style(slide, idx)
+                size_pt = layout_size or title_fallback
+                # Clamp to fit placeholder height (leave ~30% for line spacing)
+                if ph.height:
+                    max_pt = int(Emu(ph.height).pt * 0.70)
+                    if max_pt > 0:
+                        size_pt = min(size_pt, max_pt)
+                color = layout_color or _resolve_color("dk1", self.theme)
+
                 ph.text = title
                 tf = ph.text_frame
                 tf.margin_left = 0
                 tf.margin_top = 0
+                tf.word_wrap = True
                 for para in tf.paragraphs:
                     para.font.name = self.theme.fonts.major
                     para.font.bold = True
+                    para.font.size = Pt(size_pt)
+                    para.font.color.rgb = color
+                filled.add(idx)
 
-            elif idx == 1 and subtitle:
+            elif is_subtitle_ph and subtitle:
+                layout_size, layout_color = _read_layout_title_style(slide, idx)
+                size_pt = layout_size or subtitle_fallback
+                color = layout_color or _resolve_color("dk2", self.theme)
+
                 ph.text = subtitle
                 tf = ph.text_frame
                 tf.margin_left = 0
                 tf.margin_top = 0
+                tf.word_wrap = True
                 for para in tf.paragraphs:
                     para.font.name = self.theme.fonts.minor
-                    para.font.size = Pt(13)
+                    para.font.size = Pt(size_pt)
+                    para.font.color.rgb = color
+                filled.add(idx)
+
+        return filled
 
     def _render_content_slide(
         self, slide, layout: SlideLayout, content: OptimizedSlideContent
@@ -318,7 +529,11 @@ class PPTXRenderer:
         """
         # Populate template placeholders first so the slide title uses
         # the template's own font size, color, and position.
-        self._populate_placeholders(slide, content.title, content.key_message)
+        filled = self._populate_placeholders(slide, content.title, content.key_message)
+
+        # Strip leftover body/content placeholders (e.g. 'Source:', 'Click to
+        # edit text') whose inherited layout text would overlap our shapes.
+        self._strip_unused_placeholders(slide, keep_idxs=filled)
 
         # Render each shape from the layout
         for spec in layout.shapes:

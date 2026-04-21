@@ -6,8 +6,7 @@ dist/
 build/
 .venv/
 venv/
-output/batch_audit/
-output/audit_*
-output/final_*
+output/
+*.pptx
 .~lock.*
 *.~lock*

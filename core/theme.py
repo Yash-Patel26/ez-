@@ -134,11 +134,21 @@ def extract_theme(template_path: str) -> ThemeConfig:
         # If theme extraction fails, use defaults (Accenture palette)
         pass
 
+    # Deterministic structural-style pick. md5-offset-0 was chosen because
+    # it separates the three bundled hackathon templates into three distinct
+    # variants (crc32%3 collided two of them on the same variant).
+    import hashlib
+    digest = hashlib.md5(str(template_path).encode("utf-8")).hexdigest()
+    variant_idx = int(digest[:8], 16) % 3
+    style_variant = ["classic", "banded", "underline"][variant_idx]
+
     return ThemeConfig(
         colors=colors,
         fonts=fonts,
         slide_width=float(width_inches),
         slide_height=float(height_inches),
+        primary_accent_seed=str(template_path),
+        style_variant=style_variant,
     )
 
 

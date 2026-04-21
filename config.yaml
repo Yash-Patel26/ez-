@@ -38,12 +38,16 @@ typography:
   chart_label_size: 10
 
 # Content limits per slide
+# max_words_per_bullet is an upper bound — the optimizer keeps full sentences
+# whenever possible and only trims at a sentence boundary when a bullet would
+# exceed this many words. Layout engine sizes boxes/fonts to actual content.
 content:
   max_bullets_per_slide: 5
   max_text_lines: 6
-  max_words_per_bullet: 12
+  max_words_per_bullet: 30
   max_table_rows: 6
   max_table_cols: 6
+  max_table_cell_chars: 160
   max_process_steps: 5
   max_timeline_items: 6
   max_kpi_cards: 4

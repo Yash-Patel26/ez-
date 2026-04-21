@@ -85,13 +85,30 @@ def _strip_markdown(text: str) -> str:
     return text.strip()
 
 
-def _truncate_bullet(text: str, max_words: int = 15) -> str:
-    """Truncate a bullet to max_words, keeping meaningful content."""
-    text = _strip_markdown(_strip_citations(text))
+def _truncate_bullet(text: str, max_words: int = 30) -> str:
+    """Normalise a bullet to a readable, non-truncated form.
+
+    The layout engine sizes boxes and picks font sizes dynamically, so we
+    keep the full sentence whenever possible. Only very long strings get
+    shortened — and only at a sentence boundary so the result never ends
+    mid-phrase with an ellipsis.
+    """
+    text = _strip_markdown(_strip_citations(text)).strip()
+    if not text:
+        return text
     words = text.split()
     if len(words) <= max_words:
         return text
-    return ' '.join(words[:max_words]) + '...'
+
+    # Prefer a sentence boundary inside the first max_words words.
+    partial = ' '.join(words[:max_words])
+    for terminator in ('. ', '? ', '! ', '; '):
+        idx = partial.rfind(terminator)
+        if idx > len(partial) * 0.5:
+            return partial[:idx + 1].strip()
+    # No clean sentence break — keep the word boundary without adding an
+    # ellipsis; the text frame will shrink-to-fit if it overflows.
+    return partial
 
 
 class ContentOptimizer:
@@ -101,8 +118,9 @@ class ContentOptimizer:
         self.config = config or {}
         self.content_config = self.config.get("content", {})
         self.max_bullets = self.content_config.get("max_bullets_per_slide", 5)
-        self.max_words = self.content_config.get("max_words_per_bullet", 12)
+        self.max_words = self.content_config.get("max_words_per_bullet", 30)
         self.max_table_rows = self.content_config.get("max_table_rows", 6)
+        self.max_cell_chars = self.content_config.get("max_table_cell_chars", 160)
         self.api_key = os.environ.get("GEMINI_API_KEY", "")
         self.llm_config = self.config.get("llm", {})
 
@@ -395,7 +413,11 @@ CONTENT:
                 # Limit rows and clean content
                 rows = block.rows[:self.max_table_rows]
                 headers = block.headers[:6]  # max 6 columns
-                rows = [[_strip_markdown(_strip_citations(cell))[:50] for cell in row[:6]] for row in rows]
+                rows = [
+                    [_strip_markdown(_strip_citations(cell))[:self.max_cell_chars]
+                     for cell in row[:6]]
+                    for row in rows
+                ]
 
                 # Pad rows to match header count
                 for row in rows:
@@ -497,7 +519,7 @@ CONTENT:
             for block in self._iter_blocks(section):
                 if block.type in ("bullet_list", "numbered_list") and block.items:
                     for item in block.items[:5]:
-                        clean = _truncate_bullet(item, 10)
+                        clean = _truncate_bullet(item, self.max_words)
                         steps.append(ProcessStep(label=clean))
 
         if len(steps) < 3:
@@ -528,8 +550,8 @@ CONTENT:
                 for year in matches:
                     # Get surrounding context for label
                     idx = text.find(year)
-                    context = text[max(0, idx-30):idx+len(year)+50].strip()
-                    label = _truncate_bullet(context, 8)
+                    context = text[max(0, idx-30):idx+len(year)+80].strip()
+                    label = _truncate_bullet(context, 14)
                     items.append(TimelineItem(date=year, label=label))
 
         # Deduplicate by date
@@ -588,8 +610,8 @@ CONTENT:
                     elif block.content:
                         right.append(_truncate_bullet(block.content, self.max_words))
 
-        left = [_truncate_bullet(b, 10) for b in left[:4]]
-        right = [_truncate_bullet(b, 10) for b in right[:4]]
+        left = [_truncate_bullet(b, self.max_words) for b in left[:4]]
+        right = [_truncate_bullet(b, self.max_words) for b in right[:4]]
 
         if not left and not right:
             return self._optimize_bullets(spec, sections, all_text)
@@ -601,11 +623,11 @@ CONTENT:
             subs = sections[0].subsections if sections and sections[0].subsections else []
             if len(subs) >= 2:
                 comp_titles = [
-                    re.sub(r'^\d+(\.\d+)*\.?\s*', '', subs[0].heading)[:30],
-                    re.sub(r'^\d+(\.\d+)*\.?\s*', '', subs[1].heading)[:30],
+                    re.sub(r'^\d+(\.\d+)*\.?\s*', '', subs[0].heading).strip(),
+                    re.sub(r'^\d+(\.\d+)*\.?\s*', '', subs[1].heading).strip(),
                 ]
             elif len(sections) >= 2:
-                comp_titles = [sections[0].heading[:30], sections[1].heading[:30]]
+                comp_titles = [sections[0].heading, sections[1].heading]
             comp_items = [
                 ComparisonItem(title=comp_titles[0], points=left or ["Key point"]),
                 ComparisonItem(title=comp_titles[1], points=right or ["Key point"]),
@@ -635,10 +657,10 @@ CONTENT:
                 for block in self._iter_blocks(target):
                     if block.type in ("bullet_list", "numbered_list") and block.items:
                         columns[col_idx].extend(
-                            _truncate_bullet(i, 8) for i in block.items[:2]
+                            _truncate_bullet(i, self.max_words) for i in block.items[:3]
                         )
                     elif block.type == "text" and block.content:
-                        columns[col_idx].append(_truncate_bullet(block.content, 8))
+                        columns[col_idx].append(_truncate_bullet(block.content, self.max_words))
 
         # Build as comparison items
         comp_items = []
@@ -648,9 +670,7 @@ CONTENT:
 
         for idx, col in enumerate(columns[:3]):
             title = subsection_titles[idx] if idx < len(subsection_titles) else f"Point {idx+1}"
-            title = re.sub(r'^\d+(\.\d+)*\.?\s*', '', title)  # Strip numbering
-            words = title.split()
-            title = ' '.join(words[:6]) if len(words) > 6 else title
+            title = re.sub(r'^\d+(\.\d+)*\.?\s*', '', title).strip()  # Strip numbering
             comp_items.append(ComparisonItem(
                 title=title,
                 points=col[:3] if col else ["Key insight"],
@@ -693,8 +713,8 @@ CONTENT:
                     title = " ".join(words[:4])
                     desc = " ".join(words[4:])
 
-                title = title.strip()[:40]
-                desc = desc.strip()[:100]
+                title = title.strip()
+                desc = desc.strip()
                 if title:
                     items.append(ComparisonItem(
                         title=title,
@@ -707,14 +727,14 @@ CONTENT:
             # Fallback: build items from subsection headings + first bullet each
             items = []
             for sub in (sections[0].subsections if sections else [])[:6]:
-                heading = re.sub(r'^\d+(\.\d+)*\.?\s*', '', sub.heading).strip()[:40]
+                heading = re.sub(r'^\d+(\.\d+)*\.?\s*', '', sub.heading).strip()
                 first_point = ""
                 for blk in sub.content_blocks:
                     if blk.items:
-                        first_point = _truncate_bullet(blk.items[0], 12)
+                        first_point = _truncate_bullet(blk.items[0], self.max_words)
                         break
                     if blk.content:
-                        first_point = _truncate_bullet(blk.content, 12)
+                        first_point = _truncate_bullet(blk.content, self.max_words)
                         break
                 if heading:
                     items.append(ComparisonItem(title=heading, points=[first_point] if first_point else []))
@@ -755,7 +775,7 @@ CONTENT:
                 m = _value_re.search(raw)
                 value = m.group(1).strip() if m else ""
                 label = _value_re.sub("", raw).strip(" :–—-")
-                label = _truncate_bullet(label, 7)
+                label = _truncate_bullet(label, 14)
                 if label:
                     funnel_items.append(FunnelItem(label=label, value=value))
             if funnel_items:

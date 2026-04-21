@@ -208,7 +208,9 @@ def run_pipeline(
 @click.option("--output-dir", "output_dir", type=click.Path(),
               help="Output directory (batch mode)")
 @click.option("--list-layouts", is_flag=True, help="List available layouts in template and exit")
-@click.option("--clean", is_flag=True, help="Remove existing .pptx files from output dir before generating")
+@click.option("--clean/--no-clean", default=True,
+              help="Remove existing .pptx files before generating (default: on). "
+                   "Single-file mode deletes the target path; batch mode clears the output dir.")
 def main(input_path, template_path, templates_dir, output_path, target_slides, config_path,
          batch, input_dir, output_dir, list_layouts, clean):
     """MD2PPTX: Convert Markdown research reports to polished PowerPoint presentations."""
@@ -245,7 +247,8 @@ def main(input_path, template_path, templates_dir, output_path, target_slides, c
         out_dir = Path(output_dir) if output_dir else input_dir.parent / "output"
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        # Remove existing .pptx files before generating
+        # Remove existing .pptx files before generating (default behaviour).
+        # Pass --no-clean to keep stale files from a previous run.
         if clean:
             existing = list(out_dir.glob("*.pptx"))
             removed, skipped = 0, 0
@@ -258,7 +261,7 @@ def main(input_path, template_path, templates_dir, output_path, target_slides, c
             if removed or skipped:
                 msg = f"  Cleared {removed} file(s) from {out_dir}"
                 if skipped:
-                    msg += f" ({skipped} skipped — close them in PowerPoint first)"
+                    msg += f" ({skipped} open in PowerPoint — close and rerun)"
                 click.echo(msg + "\n")
 
         md_files = sorted(input_dir.glob("*.md"))
@@ -314,6 +317,22 @@ def main(input_path, template_path, templates_dir, output_path, target_slides, c
 
     # Ensure output directory exists
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+
+    # Remove the existing output file so we never leave stale content behind.
+    # prs.save() would overwrite on most platforms, but if PowerPoint has the
+    # file open (Windows file lock), fail early here with a clear message.
+    if clean:
+        out_file = Path(output_path)
+        if out_file.exists():
+            try:
+                out_file.unlink()
+            except PermissionError:
+                click.echo(
+                    f"Error: {out_file} is open in another program. "
+                    f"Close it in PowerPoint and retry.",
+                    err=True,
+                )
+                sys.exit(1)
 
     # Resolve template for single-file mode (supports --templates-dir auto-pick)
     if templates_dir_path and not template_path:
